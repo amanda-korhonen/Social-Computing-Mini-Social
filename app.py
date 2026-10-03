@@ -492,11 +492,37 @@ def add_comment(post_id):
     # Get content from the submitted form
     content = request.form.get('content')
 
+    #EDIT: Added comment karma system
+    # Find the post owner and comment time award karma for commenting
+    post = query_db('SELECT user_id, created_at FROM posts WHERE id = ?', (post_id,), one=True)
+    hours_since_post = (datetime.now() - post['created_at']).total_seconds() / 3600 if post and post['created_at'] else None
+
     # Basic validation to ensure comment is not empty
     if content and content.strip():
         db = get_db()
         db.execute('INSERT INTO comments (post_id, user_id, content) VALUES (?, ?, ?)',
                    (post_id, user_id, content))
+        
+        # Karma award for commenting on a post
+        if post and post['user_id'] != user_id:  # Ensure the user is not commenting on their own post
+            karma_amount = 0 # deside how much karma to award based on how long ago the post was made
+            if hours_since_post is not None:
+                if hours_since_post < 1:
+                    karma_amount = 0.1
+                elif hours_since_post < 12:
+                    karma_amount = 0.5
+                elif hours_since_post < 24:
+                    karma_amount = 0.7  
+                elif hours_since_post < 72:
+                    karma_amount = 0.3
+                elif hours_since_post < 120:
+                    karma_amount = 0.1
+                else:
+                    karma_amount = 0
+            else:
+                karma_amount = 0  # Default to 0 if we can't determine the post time, safeguard
+            award_karma(post['user_id'], 'comment', post_id, karma_amount)
+
         db.commit()
         flash('Your comment was added.', 'success')
     else:
@@ -570,9 +596,15 @@ def add_reaction():
                    (new_reaction_type, existing_reaction['id']))
     else:
         # Step 3: If it does not exist, INSERT a new reaction.
+
+        # EDIT: Include karma system for reactions
         db.execute('INSERT INTO reactions (post_id, user_id, reaction_type) VALUES (?, ?, ?)',
                    (post_id, user_id, new_reaction_type))
 
+        #Find post owner and add karma
+        post = query_db('SELECT user_id FROM posts WHERE id = ?', (post_id,), one=True)
+        if post and post['user_id'] != user_id:  # Ensure the user is not reacting to their own post
+            award_karma(post['user_id'], 'reaction', post_id, 0.1)
     db.commit()
 
     return redirect(request.referrer or url_for('feed'))
@@ -867,6 +899,91 @@ def loop_color(user_id):
 
 
 # ----- Functions to be implemented are below
+
+# Coding Assignment #1
+# Created a new karma column in the users table
+# and a new karma_events table to track karma changes.
+
+conn = sqlite3.connect(DATABASE)
+cursor = conn.cursor()
+
+# Add karma column
+try:
+    cursor.execute("""
+        ALTER TABLE users
+        ADD COLUMN karma REAL DEFAULT 0;
+    """)
+    print("Added karma column.")
+except sqlite3.OperationalError as e:
+    if "duplicate column name" in str(e):
+        print("karma column already exists.")
+    else:
+        raise
+
+# Create events table
+cursor.execute("""
+    CREATE TABLE IF NOT EXISTS karma_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        event_type TEXT NOT NULL,
+        source_id INTEGER NOT NULL,
+        points REAL NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+""")
+
+conn.commit()
+conn.close()
+
+print("Database update complete.")
+
+# prevent new users from earning karma until they have been registered for at least 24 hours 
+# to avoid bots and spam accounts from gaming the system
+def user_old_enough_to_earn_karma(user_id): 
+    """
+    Args:
+        user_id: The ID of the user to check.
+    Returns:
+        True if the user has been registered for at least 24 hours, False otherwise.
+    """
+    user = query_db('SELECT created_at FROM users WHERE id = ?', (user_id,), one=True)
+
+    if not user or not user['created_at']:
+        return False  # User does not exist or has no creation date
+
+    age_hours = (datetime.now() - user['created_at']).total_seconds() / 3600
+    return age_hours >= 24
+
+
+def award_karma(user_id, event_type, source_id, points):
+    """
+    Args:
+        user_id: The ID of the user to whom karma is awarded.
+        event_type: A string describing the type of event (e.g., "post", "comment", "reaction").
+        source_id: The ID of the source entity that triggered the karma award (e.g., post ID, comment ID).
+        points: The number of karma points to award, datatype REAL.
+    Returns:
+        None. This function updates the user's karma in the database and logs the event in the karma_events table.
+    """
+    if  user_old_enough_to_earn_karma(user_id):
+        db = get_db()
+
+        db.execute("""
+            INSERT INTO karma_events
+            (user_id, event_type, source_id, points)
+            VALUES (?, ?, ?, ?)
+        """, (user_id, event_type, source_id, points))
+
+        db.execute("""
+            UPDATE users
+            SET karma = karma + ?
+            WHERE id = ?
+        """, (points, user_id))
+
+        db.commit()
+    else:
+        return  # User is too new to earn karma; do nothing.
+
 # Coding Assignment #2
 
 # Assignment 2.2
