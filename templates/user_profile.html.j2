@@ -38,10 +38,13 @@
                 <strong>{{ followers_count }}</strong> Followers
               </a>
             </div>
-            <div>
+            <div class="me-4">
               <a href="/u/{{ user.username }}/following" class="text-decoration-none text-dark">
                 <strong>{{ following_count }}</strong> Following
               </a>
+            </div>
+            <div>
+              <strong>{{ '%.0f' | format(my_karma_count or 0) }}</strong> Karma
             </div>
           </div>
         </div>

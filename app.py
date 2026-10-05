@@ -112,6 +112,25 @@ def feed():
     current_user_id = session.get('user_id')
     params = []
 
+    # leaderboard for karma in feed
+    if sort == 'leaderboard':
+        if show == 'following' and current_user_id:
+            leaders = query_db(
+                'SELECT id, username, karma FROM users '
+                'WHERE karma > 0 AND id IN '
+                '(SELECT followed_id FROM follows WHERE follower_id = ?) '
+                'ORDER BY karma DESC, username ASC LIMIT 20',
+                (current_user_id,))
+        else:
+            leaders = query_db(
+                'SELECT id, username, karma FROM users '
+                'WHERE karma > 0 ORDER BY karma DESC, username ASC LIMIT 20')
+        return render_template('feed.html.j2',
+                               posts=[], leaders=leaders,
+                               current_sort=sort, current_show=show,
+                               page=1, per_page=POSTS_PER_PAGE,
+                               reaction_emojis=REACTION_EMOJIS,
+                               reaction_types=REACTION_TYPES)
     #  2. Build the Query 
     where_clause = ""
     if show == 'following' and current_user_id:
@@ -136,6 +155,7 @@ def feed():
         """
         final_params = params + list(pagination_params)
         posts = query_db(query, final_params)
+    
     elif sort == 'recommended':
         posts = recommend(current_user_id, show == 'following' and current_user_id)
     else:  # Default sort is 'new'
@@ -298,7 +318,8 @@ def user_profile(username):
 
     followers_count = query_db('SELECT COUNT(*) as cnt FROM follows WHERE followed_id = ?', (user['id'],), one=True)['cnt']
     following_count = query_db('SELECT COUNT(*) as cnt FROM follows WHERE follower_id = ?', (user['id'],), one=True)['cnt']
-
+    my_karma_count = query_db('SELECT karma FROM users WHERE id = ?', (user['id'],), one=True)['karma']
+    
     #  NEW: CHECK FOLLOW STATUS 
     is_currently_following = False # Default to False
     current_user_id = session.get('user_id')
@@ -320,6 +341,7 @@ def user_profile(username):
                            comments=comments,
                            followers_count=followers_count, 
                            following_count=following_count,
+                           my_karma_count=my_karma_count,
                            is_following=is_currently_following)
     
 
@@ -521,7 +543,7 @@ def add_comment(post_id):
                     karma_amount = 0
             else:
                 karma_amount = 0  # Default to 0 if we can't determine the post time, safeguard
-            award_karma(post['user_id'], 'comment', post_id, karma_amount)
+            award_karma(post['user_id'], 'comment', post_id, karma_amount, actor_id=user_id)  # Award karma for commenting
 
         db.commit()
         flash('Your comment was added.', 'success')
@@ -604,7 +626,7 @@ def add_reaction():
         #Find post owner and add karma
         post = query_db('SELECT user_id FROM posts WHERE id = ?', (post_id,), one=True)
         if post and post['user_id'] != user_id:  # Ensure the user is not reacting to their own post
-            award_karma(post['user_id'], 'reaction', post_id, 0.1)
+           award_karma(post['user_id'], 'reaction', post_id, 0.1, actor_id=user_id)  # Award 0.1 karma for a reaction
     db.commit()
 
     return redirect(request.referrer or url_for('feed'))
@@ -931,6 +953,17 @@ cursor.execute("""
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
 """)
+try:
+    cursor.execute("ALTER TABLE karma_events ADD COLUMN actor_id INTEGER;")
+except sqlite3.OperationalError as e:
+    if "duplicate column name" not in str(e):
+        raise
+
+cursor.execute("""
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_karma_reaction_once
+    ON karma_events (user_id, source_id, actor_id)
+    WHERE event_type = 'reaction';
+""")
 
 conn.commit()
 conn.close()
@@ -955,34 +988,45 @@ def user_old_enough_to_earn_karma(user_id):
     return age_hours >= 24
 
 
-def award_karma(user_id, event_type, source_id, points):
+def award_karma(user_id, event_type, source_id, points, actor_id):
     """
     Args:
         user_id: The ID of the user to whom karma is awarded.
         event_type: A string describing the type of event (e.g., "post", "comment", "reaction").
         source_id: The ID of the source entity that triggered the karma award (e.g., post ID, comment ID).
         points: The number of karma points to award, datatype REAL.
+        actor_id: The ID of the user who triggered the karma award (e.g., the user who liked a post).
     Returns:
         None. This function updates the user's karma in the database and logs the event in the karma_events table.
     """
-    if  user_old_enough_to_earn_karma(user_id):
-        db = get_db()
+    if not user_old_enough_to_earn_karma(user_id):
+        return False  # User is too new to earn karma; do nothing
 
-        db.execute("""
-            INSERT INTO karma_events
-            (user_id, event_type, source_id, points)
-            VALUES (?, ?, ?, ?)
-        """, (user_id, event_type, source_id, points))
+    db = get_db()
 
-        db.execute("""
-            UPDATE users
-            SET karma = karma + ?
-            WHERE id = ?
-        """, (points, user_id))
+    cur = db.execute("""
+        INSERT OR IGNORE INTO karma_events
+        (user_id, event_type, source_id, points, actor_id)
+            VALUES (?, ?, ?, ?, ?)
+        """, (user_id, event_type, source_id, points, actor_id))
 
-        db.commit()
-    else:
-        return  # User is too new to earn karma; do nothing.
+    if cur.rowcount == 0:
+        # This means the insert was ignored due to the unique constraint for reactions
+        return False  # No karma was awarded because the user already received karma for this reaction
+    db.execute("""
+        UPDATE users
+        SET karma = karma + ?
+        WHERE id = ?
+    """, (points, user_id))
+
+    db.commit()
+    return True  # Karma was successfully awarded
+
+## Karma leaderboard route
+#@app.route('/leaderboard')
+#def karma_leaderboard():
+#    top_users = query_db('SELECT username, karma FROM users WHERE karma > 0 ORDER BY karma ASC LIMIT 20')
+#    return render_template('leaderboard.html', top_users=top_users)
 
 # Coding Assignment #2
 

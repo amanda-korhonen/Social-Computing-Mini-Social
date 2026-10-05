@@ -32,6 +32,7 @@
     <a href="{{ url_for('feed', sort='new', show=current_show) }}" class="btn {% if current_sort == 'new' %}btn-primary{% else %}btn-light{% endif %}">New</a>
     <a href="{{ url_for('feed', sort='popular', show=current_show) }}" class="btn {% if current_sort == 'popular' %}btn-primary{% else %}btn-light{% endif %}">Popular</a>
     <a href="{{ url_for('feed', sort='recommended', show=current_show) }}" class="btn {% if current_sort == 'recommended' %}btn-primary{% else %}btn-light{% endif %}">Recommended</a>
+    <a href="{{ url_for('feed', sort='leaderboard', show=current_show) }}" class="btn {% if current_sort == 'leaderboard' %}btn-primary{% else %}btn-light{% endif %}">Leaderboard</a>
   </div>
 
   <!-- This is the 'show' filter for All / Following -->
@@ -46,6 +47,26 @@
 
   
 </div>
+{% if current_sort == 'leaderboard' %}
+<div class="col-md-8 mx-auto">
+  <table class="table table-hover align-middle">
+    <thead>
+      <tr><th style="width: 15%;">Rank</th><th>User</th><th class="text-end">Karma</th></tr>
+    </thead>
+    <tbody>
+      {% for u in leaders %}
+      <tr class="{% if session.get('user_id') == u.id %}table-primary{% endif %}">
+        <td>{{ loop.index }}</td>
+        <td><a href="/u/{{ u.username }}">{{ user_display(u.username) }}</a></td>
+        <td class="text-end">{{ '%.0f' | format(u.karma) }}</td>
+      </tr>
+      {% else %}
+      <tr><td colspan="3" class="text-center text-muted">No karma earned yet.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% else %}
 
 <div class="col-md-8 mx-auto">
   {% for entry in posts %}
@@ -200,4 +221,5 @@
       Next &raquo;
     </a>
   </div>
+{% endif %}
 {% endblock %}
