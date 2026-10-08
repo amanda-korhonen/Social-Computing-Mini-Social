@@ -6,7 +6,7 @@ import json
 import sqlite3
 import hashlib
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 
 app = Flask(__name__)
 app.secret_key = '123456789' 
@@ -517,7 +517,8 @@ def add_comment(post_id):
     #EDIT: Added comment karma system
     # Find the post owner and comment time award karma for commenting
     post = query_db('SELECT user_id, created_at FROM posts WHERE id = ?', (post_id,), one=True)
-    hours_since_post = (datetime.now() - post['created_at']).total_seconds() / 3600 if post and post['created_at'] else None
+    hours_since_post = (utc_now() - post['created_at']).total_seconds() / 3600 if post and post['created_at'] else None
+    karma_amount = 0 # deside how much karma to award based on how long ago the post was made
 
     # Basic validation to ensure comment is not empty
     if content and content.strip():
@@ -527,7 +528,6 @@ def add_comment(post_id):
         
         # Karma award for commenting on a post
         if post and post['user_id'] != user_id:  # Ensure the user is not commenting on their own post
-            karma_amount = 0 # deside how much karma to award based on how long ago the post was made
             if hours_since_post is not None:
                 if hours_since_post < 1:
                     karma_amount = 0.1
@@ -543,8 +543,8 @@ def add_comment(post_id):
                     karma_amount = 0
             else:
                 karma_amount = 0  # Default to 0 if we can't determine the post time, safeguard
-            award_karma(post['user_id'], 'comment', post_id, karma_amount, actor_id=user_id)  # Award karma for commenting
-
+        if karma_amount > 0 and post['user_id'] != user_id:
+            award_karma(post['user_id'], 'comment', post_id, karma_amount, actor_id=user_id, content_hash=comment_hash(content))  # Award karma for commenting
         db.commit()
         flash('Your comment was added.', 'success')
     else:
@@ -795,7 +795,7 @@ def admin_dashboard():
         _, base_score = moderate_content(post_dict['content'])
         final_score = base_score 
         author_created_dt = post_dict['user_created_at']
-        author_age_days = (datetime.utcnow() - author_created_dt).days
+        author_age_days = (utc_now() - author_created_dt).days
         if author_age_days < 7:
             final_score *= 1.5
         risk_label, risk_sort_key = get_risk_profile(final_score)
@@ -822,7 +822,7 @@ def admin_dashboard():
         comment_dict = dict(comment)
         _, score = moderate_content(comment_dict['content'])
         author_created_dt = comment_dict['user_created_at']
-        author_age_days = (datetime.utcnow() - author_created_dt).days
+        author_age_days = (utc_now() - author_created_dt).days
         if author_age_days < 7:
             score *= 1.5
         risk_label, risk_sort_key = get_risk_profile(score)
@@ -964,11 +964,50 @@ cursor.execute("""
     ON karma_events (user_id, source_id, actor_id)
     WHERE event_type = 'reaction';
 """)
+# Add content_hash column to karma_events for comment uniqueness
+try:
+    cursor.execute("ALTER TABLE karma_events ADD COLUMN content_hash TEXT;")
+except sqlite3.OperationalError as e:
+    if "duplicate column name" not in str(e):
+        raise
+
+try:
+    # identical (normalized) comment text earns karma only once per commenter
+    cursor.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_karma_comment_unique_text
+        ON karma_events (actor_id, content_hash)
+        WHERE event_type = 'comment';
+    """)
+except sqlite3.IntegrityError:
+    print("WARNING: idx_karma_comment_unique_text not created - old duplicate karma rows exist. Run backfill_karma.py, then restart.")
 
 conn.commit()
 conn.close()
 
 print("Database update complete.")
+
+# Helper functions to fix bugs in comment karma system
+def utc_now():
+    """Naive UTC 'now', comparable to SQLite CURRENT_TIMESTAMP values."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+def normalize_text(text):
+    text = re.sub(r'[^\w\s]', '', (text or '').lower())
+    return re.sub(r'\s+', ' ', text).strip()
+
+def comment_hash(text):
+    '''To check for duplicate comments, we normalize the text and hash it.'''
+    return hashlib.sha256(normalize_text(text).encode('utf-8')).hexdigest()
+
+def post_is_original(post_id):
+    """False if the post's author already has an earlier post with the same text."""
+    post = query_db('SELECT user_id, content FROM posts WHERE id = ?', (post_id,), one=True)
+    if not post:
+        return False
+    target = normalize_text(post['content'])
+    earlier = query_db('SELECT content FROM posts WHERE user_id = ? AND id < ?',
+                       (post['user_id'], post_id))
+    return all(normalize_text(p['content']) != target for p in earlier)
 
 # prevent new users from earning karma until they have been registered for at least 24 hours 
 # to avoid bots and spam accounts from gaming the system
@@ -984,11 +1023,11 @@ def user_old_enough_to_earn_karma(user_id):
     if not user or not user['created_at']:
         return False  # User does not exist or has no creation date
 
-    age_hours = (datetime.now() - user['created_at']).total_seconds() / 3600
+    age_hours = (utc_now() - user['created_at']).total_seconds() / 3600
     return age_hours >= 24
 
 
-def award_karma(user_id, event_type, source_id, points, actor_id):
+def award_karma(user_id, event_type, source_id, points, actor_id, content_hash=None):
     """
     Args:
         user_id: The ID of the user to whom karma is awarded.
@@ -1001,14 +1040,25 @@ def award_karma(user_id, event_type, source_id, points, actor_id):
     """
     if not user_old_enough_to_earn_karma(user_id):
         return False  # User is too new to earn karma; do nothing
+    
+    if event_type in ('reaction', 'comment') and not post_is_original(source_id):
+        return False  # duplicate post, no karma 
+
+    if event_type == 'comment' and content_hash:
+        already = query_db(
+            "SELECT 1 FROM karma_events WHERE event_type = 'comment' "
+            "AND actor_id = ? AND content_hash = ? LIMIT 1",
+            (actor_id, content_hash), one=True)
+    if already:
+        return False  # identical comment text already earned karma for this commenter
 
     db = get_db()
 
     cur = db.execute("""
         INSERT OR IGNORE INTO karma_events
-        (user_id, event_type, source_id, points, actor_id)
-            VALUES (?, ?, ?, ?, ?)
-        """, (user_id, event_type, source_id, points, actor_id))
+        (user_id, event_type, source_id, points, actor_id, content_hash)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (user_id, event_type, source_id, points, actor_id, content_hash))
 
     if cur.rowcount == 0:
         # This means the insert was ignored due to the unique constraint for reactions
