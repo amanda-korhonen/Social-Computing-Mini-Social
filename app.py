@@ -1267,7 +1267,7 @@ def moderate_content(content):
 # Design claim 9 -- Gags and bans can limit the continuing damage of a bad actor, but 
 # only if it is hard for the bad actor to use a different account or if the ban is disguised.
 
-SHADOW_BAN_HOURS = [6, 12, 24]      # 1st ban, 2nd ban, 3rd and later bans
+SHADOW_BAN_HOURS = [1, 3, 12]      # 1st ban, 2nd ban, 3rd and later bans
 
 
 def utc_str(dt):
