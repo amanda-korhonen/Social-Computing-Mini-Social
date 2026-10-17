@@ -1288,8 +1288,8 @@ def visible_sql(alias):
     (an alias of posts or comments) that the current viewer is allowed to see:
       - the author always sees their own content
       - the admin sees everything (needed for moderation)
-      - everyone else does NOT see content that was written during a shadow ban
-        (shadow_hidden = 1), nor ANY content of a user whose ban is running right now
+      - everyone else does not see messages written from the moment of a shadow ban
+        onwards (shadow_hidden = 1). Messages written BEFORE the ban stay visible.
     """
     if session.get('username') == 'admin':
         return '1 = 1', ()
