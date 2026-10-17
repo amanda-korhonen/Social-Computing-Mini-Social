@@ -1073,6 +1073,8 @@ def award_karma(user_id, event_type, source_id, points, actor_id, content_hash=N
     """
     if user_risk_analysis(user_id) >= 5.0:  # MEDIUM risk or higher do not award karma
         return False  # User is flagged as high risk; do nothing
+    if is_shadow_banned(actor_id):
+        return False  # Reacting / Commenting user is shadow banned; do nothing
     
     if not user_old_enough_to_earn_karma(user_id):
         return False  # User is too new to earn karma; do nothing
