@@ -1,4 +1,4 @@
-from flask import Flask, render_template, request, redirect, url_for, session, flash, g
+from flask import Flask, render_template, request, redirect, url_for, session, flash, g, abort
 from werkzeug.security import generate_password_hash, check_password_hash
 from cryptography.fernet import Fernet
 import collections
@@ -6,7 +6,7 @@ import json
 import sqlite3
 import hashlib
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 app = Flask(__name__)
 app.secret_key = '123456789' 
@@ -132,10 +132,12 @@ def feed():
                                reaction_emojis=REACTION_EMOJIS,
                                reaction_types=REACTION_TYPES)
     #  2. Build the Query 
-    where_clause = ""
+    vis_sql, vis_params = visible_sql('p')
+    conditions, params = [vis_sql], list(vis_params)
     if show == 'following' and current_user_id:
-        where_clause = "WHERE p.user_id IN (SELECT followed_id FROM follows WHERE follower_id = ?)"
+        conditions.append("p.user_id IN (SELECT followed_id FROM follows WHERE follower_id = ?)")
         params.append(current_user_id)
+    where_clause = "WHERE " + " AND ".join(conditions)
 
     # Add the pagination parameters to the query arguments
     pagination_params = (POSTS_PER_PAGE, offset)
@@ -171,6 +173,7 @@ def feed():
         posts = query_db(query, final_params)
 
     posts_data = []
+    cvis_sql, cvis_params = visible_sql('c')
     for post in posts:
         # Determine if the current user follows the poster
         followed_poster = False
@@ -195,7 +198,11 @@ def feed():
                 user_reaction = reaction_check['reaction_type']
 
         reactions = query_db('SELECT reaction_type, COUNT(*) as count FROM reactions WHERE post_id = ? GROUP BY reaction_type', (post['id'],))
-        comments_raw = query_db('SELECT c.id, c.content, c.created_at, u.username, u.id as user_id FROM comments c JOIN users u ON c.user_id = u.id WHERE c.post_id = ? ORDER BY c.created_at ASC', (post['id'],))
+        # Edit for shadow ban: only show comments that are visible to the current user
+        comments_raw = query_db(
+        'SELECT c.id, c.content, c.created_at, u.username, u.id as user_id FROM comments c '
+        'JOIN users u ON c.user_id = u.id WHERE c.post_id = ? AND ' + cvis_sql + ' ORDER BY c.created_at ASC',
+        (post['id'],) + cvis_params)
         post_dict = dict(post)
         post_dict['content'], _ = moderate_content(post_dict['content'])
         comments_moderated = []
@@ -238,11 +245,15 @@ def add_post():
     moderated_content = content
 
     # Basic validation to ensure post is not empty
+    # Modified to add shadow ban feature
     if moderated_content and moderated_content.strip():
         db = get_db()
-        db.execute('INSERT INTO posts (user_id, content) VALUES (?, ?)',
-                   (user_id, moderated_content))
+        hidden = 1 if is_shadow_banned(user_id) else 0
+        cur = db.execute('INSERT INTO posts (user_id, content, shadow_hidden) VALUES (?, ?, ?)',
+                         (user_id, moderated_content, hidden))
         db.commit()
+        # Check if the user should be shadow banned after this post
+        apply_shadow_ban_if_needed(user_id, 'posts', cur.lastrowid, moderated_content)  
         flash('Your post was successfully created!', 'success')
     else:
         # This will catch empty posts or posts that were fully censored
@@ -300,7 +311,10 @@ def user_profile(username):
     moderated_bio, _ = moderate_content(user.get('profile', ''))
     user['profile'] = moderated_bio
 
-    posts_raw = query_db('SELECT id, content, user_id, created_at FROM posts WHERE user_id = ? ORDER BY created_at DESC', (user['id'],))
+    pvis, pparams = visible_sql('p')
+    posts_raw = query_db('SELECT p.id, p.content, p.user_id, p.created_at FROM posts p '
+                         'WHERE p.user_id = ? AND ' + pvis + ' ORDER BY p.created_at DESC',
+                         (user['id'],) + pparams)
     posts = []
     for post_raw in posts_raw:
         post = dict(post_raw)
@@ -308,7 +322,10 @@ def user_profile(username):
         post['content'] = moderated_post_content
         posts.append(post)
 
-    comments_raw = query_db('SELECT id, content, user_id, post_id, created_at FROM comments WHERE user_id = ? ORDER BY created_at DESC LIMIT 100', (user['id'],))
+    cvis, cparams = visible_sql('c')
+    comments_raw = query_db('SELECT c.id, c.content, c.user_id, c.post_id, c.created_at FROM comments c '
+                            'WHERE c.user_id = ? AND ' + cvis + ' ORDER BY c.created_at DESC LIMIT 100',
+                            (user['id'],) + cparams)
     comments = []
     for comment_raw in comments_raw:
         comment = dict(comment_raw)
@@ -374,13 +391,13 @@ def user_following(username):
 @app.route('/posts/<int:post_id>')
 def post_detail(post_id):
     """Displays a single post and its comments, with content moderation applied."""
-    
+    # Modification for shadow ban: only fetch the post if it's visible to the current user
+    vis_sql, vis_params = visible_sql('p')
+
     post_raw = query_db('''
         SELECT p.id, p.content, p.created_at, u.username, u.id as user_id
-        FROM posts p
-        JOIN users u ON p.user_id = u.id
-        WHERE p.id = ?
-    ''', (post_id,), one=True)
+        FROM posts p JOIN users u ON p.user_id = u.id
+        WHERE p.id = ? AND ''' + vis_sql, (post_id,) + vis_params, one=True)
 
     if not post_raw:
         # The abort function will stop the request and show a 404 Not Found page.
@@ -523,8 +540,9 @@ def add_comment(post_id):
     # Basic validation to ensure comment is not empty
     if content and content.strip():
         db = get_db()
-        db.execute('INSERT INTO comments (post_id, user_id, content) VALUES (?, ?, ?)',
-                   (post_id, user_id, content))
+        hidden = 1 if is_shadow_banned(user_id) else 0
+        cur = db.execute('INSERT INTO comments (post_id, user_id, content, shadow_hidden) VALUES (?, ?, ?, ?)',
+                   (post_id, user_id, content, hidden))
         
         # Karma award for commenting on a post
         if post and post['user_id'] != user_id:  # Ensure the user is not commenting on their own post
@@ -545,7 +563,9 @@ def add_comment(post_id):
                 karma_amount = 0  # Default to 0 if we can't determine the post time, safeguard
         if karma_amount > 0 and post['user_id'] != user_id:
             award_karma(post['user_id'], 'comment', post_id, karma_amount, actor_id=user_id, content_hash=comment_hash(content))  # Award karma for commenting
+        
         db.commit()
+        apply_shadow_ban_if_needed(user_id, 'comments', cur.lastrowid, content)  # Check if the user should be shadow banned after this comment
         flash('Your comment was added.', 'success')
     else:
         flash('Comment cannot be empty.', 'warning')
@@ -981,6 +1001,18 @@ try:
 except sqlite3.IntegrityError:
     print("WARNING: idx_karma_comment_unique_text not created - old duplicate karma rows exist. Run backfill_karma.py, then restart.")
 
+# shadow ban modifications to database schema
+for stmt in (
+    "ALTER TABLE users ADD COLUMN shadow_banned_until TEXT;",
+    "ALTER TABLE users ADD COLUMN shadow_ban_count INTEGER DEFAULT 0;",
+    "ALTER TABLE posts ADD COLUMN shadow_hidden INTEGER DEFAULT 0;",
+    "ALTER TABLE comments ADD COLUMN shadow_hidden INTEGER DEFAULT 0;",
+):
+    try:
+        cursor.execute(stmt)
+    except sqlite3.OperationalError as e:
+        if "duplicate column name" not in str(e):
+            raise
 conn.commit()
 conn.close()
 
@@ -1029,6 +1061,7 @@ def user_old_enough_to_earn_karma(user_id):
 
 def award_karma(user_id, event_type, source_id, points, actor_id, content_hash=None):
     """
+    If user risk score is below 5.0 and user is old enough, award karma points to a user for a specific event.
     Args:
         user_id: The ID of the user to whom karma is awarded.
         event_type: A string describing the type of event (e.g., "post", "comment", "reaction").
@@ -1038,6 +1071,9 @@ def award_karma(user_id, event_type, source_id, points, actor_id, content_hash=N
     Returns:
         None. This function updates the user's karma in the database and logs the event in the karma_events table.
     """
+    if user_risk_analysis(user_id) >= 5.0:  # MEDIUM risk or higher do not award karma
+        return False  # User is flagged as high risk; do nothing
+    
     if not user_old_enough_to_earn_karma(user_id):
         return False  # User is too new to earn karma; do nothing
     
@@ -1049,8 +1085,8 @@ def award_karma(user_id, event_type, source_id, points, actor_id, content_hash=N
             "SELECT 1 FROM karma_events WHERE event_type = 'comment' "
             "AND actor_id = ? AND content_hash = ? LIMIT 1",
             (actor_id, content_hash), one=True)
-    if already:
-        return False  # identical comment text already earned karma for this commenter
+        if already:
+            return False  # identical comment text already earned karma for this commenter
 
     db = get_db()
 
@@ -1072,14 +1108,7 @@ def award_karma(user_id, event_type, source_id, points, actor_id, content_hash=N
     db.commit()
     return True  # Karma was successfully awarded
 
-## Karma leaderboard route
-#@app.route('/leaderboard')
-#def karma_leaderboard():
-#    top_users = query_db('SELECT username, karma FROM users WHERE karma > 0 ORDER BY karma ASC LIMIT 20')
-#    return render_template('leaderboard.html', top_users=top_users)
-
 # Coding Assignment #2
-
 # Assignment 2.2
 def user_risk_analysis(user_id):
     """
@@ -1087,18 +1116,99 @@ def user_risk_analysis(user_id):
         user_id: The ID of the user on which we perform risk analysis.
 
     Returns:
-        A float number score showing the risk associated with this user. There are no strict rules or bounds to this score, other than that a score of less than 1.0 means no risk, 1.0 to 3.0 is low risk, 3.0 to 5.0 is medium risk and above 5.0 is high risk. (An upper bound of 5.0 is applied to this score elsewhere in the codebase) 
+        A float number score showing the risk associated with this user. 
+        There are no strict rules or bounds to this score, other than that a score of less than 1.0 means
+        no risk, 1.0 to 3.0 is low risk, 3.0 to 5.0 is medium risk and above 5.0 is high risk.
+         (An upper bound of 5.0 is applied to this score elsewhere in the codebase) 
         
         You will be able to check the scores by logging in with the administrator account:
             username: admin
             password: admin
         Then, navigate to the /admin endpoint. (http://localhost:8080/admin)
     """
-    
-    score = 0
+    user = query_db('SELECT profile, created_at FROM users WHERE id = ?', (user_id,), one=True)
+    if not user:
+        return 0.0
+ 
+    # Step 1: content score of the profile text
+    _, profile_score = moderate_content(user['profile'] or '')
+ 
+    # Step 2: average content score over all of the user's posts (0 if none)
+    posts = query_db('SELECT content FROM posts WHERE user_id = ?', (user_id,))
+    average_post_score = 0.0
+    if posts:
+        average_post_score = sum(moderate_content(p['content'])[1] for p in posts) / len(posts)
+ 
+    # Step 3: average content score over all of the user's comments (0 if none)
+    comments = query_db('SELECT content FROM comments WHERE user_id = ?', (user_id,))
+    average_comment_score = 0.0
+    if comments:
+        average_comment_score = sum(moderate_content(c['content'])[1] for c in comments) / len(comments)
+ 
+    # Step 4: weighted combination
+    content_risk_score = (profile_score * 1) + (average_post_score * 3) + (average_comment_score * 1)
+ 
+    # Step 5: account-age multiplier
+    created_at = user['created_at']
+    if isinstance(created_at, str):                      # in case no datetime converter is active
+        created_at = datetime.strptime(created_at[:19], '%Y-%m-%d %H:%M:%S')
+    account_age_days = (utc_now() - created_at).days if created_at else 9999
+ 
+    if account_age_days < 7:
+        user_risk_score = content_risk_score * 1.5
+    elif account_age_days < 30:
+        user_risk_score = content_risk_score * 1.2
+    else:
+        user_risk_score = content_risk_score
+ 
+    # Step 6: cap at 5.0 (rounded first so float noise like 2.9999999999999996 can't drop a level)
+    return min(5.0, round(user_risk_score, 6))
 
-    return score;
+# Helper function to build regex patterns for Tier 1, Tier 2, and Tier 3 words/phrases
+def _build_pattern(entries):
+    r"""
+    One case-insensitive regex matching any entry as a WHOLE word/phrase.
+    (?<!\\w) / (?!\\w) are used instead of \\b so entries that start or end with a
+    symbol still match as whole words. Whitespace inside a phrase matches any run of
+    whitespace, so "free  money" (two spaces) cannot dodge "free money".
 
+    (?<!\w) means “the character before must not be a letter, digit or underscore”.
+    (?!\w) means “the character after must not be one either”.
+    Together they enforce whole words: darn matches in “darn it” or “Darn!” but not in “darned” or “darnit”.
+    re.IGNORECASE makes the match case-insensitive.
+
+    """
+    parts = set()
+    for entry in entries or []:
+        tokens = str(entry).split()          # also skips empty / blank entries
+        if tokens:
+            parts.add(r'\s+'.join(re.escape(t) for t in tokens))
+    if not parts:                            # an empty alternation would match everything
+        return None
+    longest_first = sorted(parts, key=len, reverse=True)
+    return re.compile(r'(?<!\w)(?:' + '|'.join(longest_first) + r')(?!\w)', re.IGNORECASE)
+ 
+TIER1_PATTERN = _build_pattern(TIER1_WORDS)
+TIER2_PATTERN = _build_pattern(TIER2_PHRASES)
+TIER3_PATTERN = _build_pattern(TIER3_WORDS)
+
+# http(s)/ftp URLs, www. addresses, and bare domains with a common TLD (emails excluded)
+URL_PATTERN = re.compile(
+    r'(?:(?:https?|ftp)://[^\s<>"\']+'
+    r'|www\.[^\s<>"\']+'
+    r'|(?<![\w@.-])(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+'
+    r'(?:com|net|org|edu|gov|info|biz|io|co|me|xyz|app|dev|ly|tv|us|uk|de|fr|ru|cn|fi'
+    r'|top|site|online|club|shop|link|live)(?![\w-])(?:/[^\s<>"\']*)?)',
+    re.IGNORECASE)
+ 
+def _replace_link(match):
+    """
+    Replace the URL but keep sentence punctuation that trails it 
+    ("see x.com." -> "see [link removed].").
+    """
+    url = match.group(0)
+    trailing = url[len(url.rstrip('.,;:!?)]}\'"')):]
+    return '[link removed]' + trailing
     
 # Assignment 2.1
 def moderate_content(content):
@@ -1107,21 +1217,110 @@ def moderate_content(content):
         content: the text content of a post or comment to be moderated.
         
     Returns: 
-        A tuple containing the moderated content (string) and a severity score (float). There are no strict rules or bounds to the severity score, other than that a score of less than 1.0 means no risk, 1.0 to 3.0 is low risk, 3.0 to 5.0 is medium risk and above 5.0 is high risk.
+        A tuple containing the moderated content (string) and a severity score (float). 
+        There are no strict rules or bounds to the severity score, other than that 
+        a score of less than 1.0 means no risk, 1.0 to 3.0 is low risk, 3.0 to 5.0 is 
+        medium risk and above 5.0 is high risk.
     
     This function moderates a string of content and calculates a severity score based on
-    rules loaded from the 'censorship.dat' file. These are already loaded as TIER1_WORDS, TIER2_PHRASES and TIER3_WORDS. Tier 1 corresponds to strong profanity, Tier 2 to scam/spam phrases and Tier 3 to mild profanity.
+    rules loaded from the 'censorship.dat' file. These are already loaded as TIER1_WORDS,
+    TIER2_PHRASES and TIER3_WORDS. Tier 1 corresponds to strong profanity, 
+    Tier 2 to scam/spam phrases and Tier 3 to mild profanity.
     
     You will be able to check the scores by logging in with the administrator account:
             username: admin
             password: admin
     Then, navigate to the /admin endpoint. (http://localhost:8080/admin)
     """
+    if not content:
+        return "", 0.0  # Return empty content and zero score for None or empty input
 
-    moderated_content = content
-    score = 0
+    # Stage 1.1 - severe violations (Tier 1 first, then Tier 2)
+    if TIER1_PATTERN and TIER1_PATTERN.search(content):
+        return '[content removed due to severe violation]', 5.0
+    if TIER2_PATTERN and TIER2_PATTERN.search(content):
+        return '[content removed due to spam/scam policy]', 5.0
     
-    return moderated_content, score
+    moderated = content
+    score = 0.0
+
+    # Rule 1.2.1 - Tier 3 words: asterisks of equal length, +2.0 per match
+    if TIER3_PATTERN:
+        moderated, n_words = TIER3_PATTERN.subn(lambda m: '*' * len(m.group(0)), moderated)
+        score += 2.0 * n_words
+ 
+    # Rule 1.2.2 - external links: [link removed], +2.0 per match
+    moderated, n_links = URL_PATTERN.subn(_replace_link, moderated)
+    score += 2.0 * n_links
+ 
+    # Rule 1.2.3 - excessive capitalization: +0.5, content unchanged.
+    # Measured on the submitted text so the placeholders above cannot skew the ratio.
+    letters = [ch for ch in content if ch.isalpha()]
+    if len(letters) > 15 and sum(ch.isupper() for ch in letters) / len(letters) > 0.70:
+        score += 0.5
+
+    return moderated, score
+
+# Shadow banning 
+# Design claim 9 -- Gags and bans can limit the continuing damage of a bad actor, but 
+# only if it is hard for the bad actor to use a different account or if the ban is disguised.
+
+SHADOW_BAN_HOURS = [6, 12, 24]      # 1st ban, 2nd ban, 3rd and later bans
+
+
+def utc_str(dt):
+    """UTC datetime -> 'YYYY-MM-DD HH:MM:SS' (sorts correctly as text, same as CURRENT_TIMESTAMP)."""
+    return dt.strftime('%Y-%m-%d %H:%M:%S')
+
+
+def is_shadow_banned(user_id):
+    """True while the user's shadow ban is running."""
+    row = query_db('SELECT shadow_banned_until FROM users WHERE id = ?', (user_id,), one=True)
+    return bool(row and row['shadow_banned_until']
+                and row['shadow_banned_until'] > utc_str(utc_now()))
+
+
+def visible_sql(alias):
+    """
+    SQL condition (plus its parameters) that keeps only the rows of table `alias`
+    (an alias of posts or comments) that the current viewer is allowed to see:
+      - the author always sees their own content
+      - the admin sees everything (needed for moderation)
+      - everyone else does NOT see content that was written during a shadow ban
+        (shadow_hidden = 1), nor ANY content of a user whose ban is running right now
+    """
+    if session.get('username') == 'admin':
+        return '1 = 1', ()
+    viewer = session.get('user_id') or 0
+    return f"({alias}.shadow_hidden = 0 OR {alias}.user_id = ?)", (viewer,)
+
+
+def apply_shadow_ban_if_needed(user_id, table, row_id, content):
+    """
+    Call right after a user's post/comment has been saved (table = 'posts' or 'comments').
+    Starts a shadow ban when the user's risk score has reached HIGH (5.0). The 6h / 12h / 24h
+    length depends on how many bans they had before. Only NEW violating content can start a ban,
+    so a clean post right after a ban ends does not trigger the next one.
+    """
+
+    assert table in ('posts', 'comments')
+    if is_shadow_banned(user_id):
+        return
+    if moderate_content(content)[1] <= 0:
+        return
+    if user_risk_analysis(user_id) < 5.0:
+        return
+
+    user = query_db('SELECT shadow_ban_count FROM users WHERE id = ?', (user_id,), one=True)
+    previous_bans = (user['shadow_ban_count'] or 0) if user else 0
+    hours = SHADOW_BAN_HOURS[min(previous_bans, len(SHADOW_BAN_HOURS) - 1)]
+    until = utc_str(utc_now() + timedelta(hours=hours))
+
+    db = get_db()
+    db.execute('UPDATE users SET shadow_banned_until = ?, shadow_ban_count = shadow_ban_count + 1 '
+               'WHERE id = ?', (until, user_id))
+    db.execute(f'UPDATE {table} SET shadow_hidden = 1 WHERE id = ?', (row_id,))  # the triggering message too
+    db.commit()
 
 # Coding Assignment #3
 # Assignment 3.1
