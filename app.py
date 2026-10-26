@@ -1,12 +1,13 @@
 from flask import Flask, render_template, request, redirect, url_for, session, flash, g, abort
 from werkzeug.security import generate_password_hash, check_password_hash
 from cryptography.fernet import Fernet
-import collections
 import json
 import sqlite3
 import hashlib
 import re
 from datetime import datetime, timezone, timedelta
+import math
+from collections import Counter, defaultdict
 
 app = Flask(__name__)
 app.secret_key = '123456789' 
@@ -157,9 +158,12 @@ def feed():
         """
         final_params = params + list(pagination_params)
         posts = query_db(query, final_params)
-    
+
+    #  3. Handle Recommended Sort
     elif sort == 'recommended':
-        posts = recommend(current_user_id, show == 'following' and current_user_id)
+        topic = request.args.get('topic')
+        posts = recommend(current_user_id, show == 'following' and current_user_id, topic)
+
     else:  # Default sort is 'new'
         query = f"""
             SELECT p.id, p.content, p.created_at, u.username, u.id as user_id
@@ -223,6 +227,8 @@ def feed():
                            posts=posts_data, 
                            current_sort=sort,
                            current_show=show,
+                           current_topic=request.args.get('topic'),
+                           topics=recommend_topics(current_user_id) if sort == 'recommended' else [],
                            page=page, # Pass current page number
                            per_page=POSTS_PER_PAGE, # Pass items per page
                            reaction_emojis=REACTION_EMOJIS,
@@ -1194,13 +1200,17 @@ TIER1_PATTERN = _build_pattern(TIER1_WORDS)
 TIER2_PATTERN = _build_pattern(TIER2_PHRASES)
 TIER3_PATTERN = _build_pattern(TIER3_WORDS)
 
-# http(s)/ftp URLs, www. addresses, and bare domains with a common TLD (emails excluded)
+_TLDS = (r'com|net|org|edu|gov|info|biz|io|co|me|xyz|app|dev|ly|tv|us|uk|de|fr|ru|cn|fi'
+         r'|top|site|online|club|shop|link|live|win|click')
+
+# a "dot" may be disguised: [.]  (.)  {.}  [dot]  (dot)  {dot}  or a full-width/ideographic dot
+_DOT = r'(?:\.|\[\.\]|\(\.\)|\{\.\}|\[dot\]|\(dot\)|\{dot\}|[\uFF0E\u3002\uFF61])'
+
 URL_PATTERN = re.compile(
-    r'(?:(?:https?|ftp)://[^\s<>"\']+'
-    r'|www\.[^\s<>"\']+'
-    r'|(?<![\w@.-])(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+'
-    r'(?:com|net|org|edu|gov|info|biz|io|co|me|xyz|app|dev|ly|tv|us|uk|de|fr|ru|cn|fi'
-    r'|top|site|online|club|shop|link|live)(?![\w-])(?:/[^\s<>"\']*)?)',
+    r'(?:(?:https?|hxxps?|ftp)://[^\s<>"\']+'
+    r'|www' + _DOT + r'[^\s<>"\']+'
+    r'|(?<![\w@.-])(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?' + _DOT + r')+'
+    r'(?:' + _TLDS + r')(?![\w-])(?:/[^\s<>"\']*)?)',
     re.IGNORECASE)
  
 def _replace_link(match):
@@ -1326,16 +1336,147 @@ def apply_shadow_ban_if_needed(user_id, table, row_id, content):
 
 # Coding Assignment #3
 # Assignment 3.1
-def recommend(user_id, filter_following):
+
+RECOMMEND_COUNT = 5
+MIN_AUTHORS_PER_TOPIC = 3      # a term must be used by >= 3 different users
+MAX_DOC_FRACTION = 0.50        # ignore terms that appear in > 50% of all posts
+EXCLUDE_ENGAGED = True         # don't recommend posts the user already reacted to / commented on
+W_COMMENT, W_REACTION, W_FOLLOW = 3.0, 2.0, 1.0
+
+TOPIC_STOPWORDS = {
+    "the", "and", "for", "with", "that", "this", "just", "you", "are", "was", "but", "have",
+    "has", "had", "not", "all", "can", "its", "our", "your", "very", "from", "they", "them",
+    "their", "what", "when", "why", "how", "who", "will", "would", "could", "should", "been",
+    "being", "into", "out", "about", "than", "then", "too", "got", "get", "one", "more", "some",
+    "any", "now", "day", "today", "let", "lets", "like", "feel", "feeling", "every", "little",
+    "bit", "new", "still", "even", "also", "much", "made", "make", "time", "think", "really",
+}
+ 
+_HASHTAG = re.compile(r"#(\w+)")
+_WORD = re.compile(r"[A-Za-z][A-Za-z0-9']{2,}")
+_CAMEL = re.compile(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+")
+ 
+_TOPIC_CACHE = {"key": None, "data": None}
+
+def extract_terms(text):
+    """
+    Turn post text into a set of topic terms.
+    - "#DIYFail" gives '#diyfail' plus its CamelCase parts 'diy' and 'fail', so
+      #DIYFail, #DIY and the plain word "DIY" all point at the same topic.
+    - plain words are lower-cased; stopwords and very short words are dropped.
+    """
+    terms = set()
+    for tag in _HASHTAG.findall(text or ""):
+        terms.add("#" + tag.lower())
+        for part in _CAMEL.findall(tag):
+            part = part.lower()
+            if len(part) >= 3 and part not in TOPIC_STOPWORDS:
+                terms.add(part)
+    no_tags = _HASHTAG.sub(" ", text or "")
+    for w in _WORD.findall(no_tags):
+        w = w.lower().strip("'")
+        if len(w) >= 3 and w not in TOPIC_STOPWORDS:
+            terms.add(w)
+    return terms
+ 
+ 
+def get_topic_index():
+    """
+    The 'database of popular words'. Returns (post_terms, vocab) where
+      post_terms: {post_id: set(terms)}  (only posts that pass moderation)
+      vocab:      {term: idf_weight}     (only popular, safe terms)
+    Cached until the posts table changes.
+    """
+    stamp = query_db("SELECT COUNT(*) AS n, IFNULL(MAX(id), 0) AS m, "
+                     "IFNULL(SUM(shadow_hidden), 0) AS s FROM posts", one=True)
+    key = (stamp["n"], stamp["m"], stamp["s"])
+    if _TOPIC_CACHE["key"] == key:
+        return _TOPIC_CACHE["data"]
+ 
+    rows = query_db("SELECT id, user_id, content FROM posts WHERE shadow_hidden = 0")
+    post_terms, doc_freq, authors = {}, Counter(), defaultdict(set)
+    for r in rows:
+        # anything the moderation system flags (profanity, scam phrases, links) never feeds the vocabulary
+        if moderate_content(r["content"])[1] > 0:
+            continue
+        terms = extract_terms(r["content"])
+        post_terms[r["id"]] = terms
+        for t in terms:
+            doc_freq[t] += 1
+            authors[t].add(r["user_id"])
+ 
+    n = max(len(post_terms), 1)
+    vocab = {}
+    for t, df in doc_freq.items():
+        if len(authors[t]) < MIN_AUTHORS_PER_TOPIC:   # one spammer cannot create a "popular" topic
+            continue
+        if df / n > MAX_DOC_FRACTION:                  # too generic to say anything about taste
+            continue
+        vocab[t] = math.log(n / df)
+ 
+    _TOPIC_CACHE["key"], _TOPIC_CACHE["data"] = key, (post_terms, vocab)
+    return post_terms, vocab
+ 
+ 
+def _engaged_post_ids(user_id):
+    """Post ids the user has commented on or reacted to."""
+    ids = set()
+    for r in query_db("SELECT DISTINCT post_id FROM comments WHERE user_id = ?", (user_id,)):
+        ids.add(r["post_id"])
+    for r in query_db("SELECT DISTINCT post_id FROM reactions WHERE user_id = ?", (user_id,)):
+        ids.add(r["post_id"])
+    return ids
+ 
+ 
+def build_user_profile(user_id, post_terms, vocab):
+    """{term: interest weight}, built from comments, reactions and followed authors' posts."""
+    profile = Counter()
+    if not user_id:
+        return profile
+ 
+    def add(post_ids, weight):
+        for pid in post_ids:
+            for t in post_terms.get(pid, ()):
+                if t in vocab:
+                    profile[t] += weight * vocab[t]
+ 
+    add([r["post_id"] for r in query_db(
+        "SELECT post_id FROM comments WHERE user_id = ?", (user_id,))], W_COMMENT)
+    add([r["post_id"] for r in query_db(
+        "SELECT post_id FROM reactions WHERE user_id = ?", (user_id,))], W_REACTION)
+    add([r["id"] for r in query_db(
+        "SELECT p.id FROM posts p JOIN follows f ON f.followed_id = p.user_id "
+        "WHERE f.follower_id = ?", (user_id,))], W_FOLLOW)
+    return profile
+ 
+ 
+def recommend_topics(user_id, k=5):
+    """Top-k topic terms for the chips above the Recommended tab (e.g. ['#diyfail', 'diy'])."""
+    post_terms, vocab = get_topic_index()
+    profile = build_user_profile(user_id, post_terms, vocab)
+    candidates = [t for t, _ in profile.most_common(k * 4)]
+    # a plain word that is just a piece of a candidate hashtag ('fail' in '#diyfail') is redundant
+    chosen = [t for t in candidates
+              if t.startswith("#") or not any(c.startswith("#") and t in c for c in candidates)]
+    chosen = chosen[:k]
+    return chosen
+
+
+def recommend(user_id, filter_following, topic=None):
     """
     Args:
         user_id: The ID of the current user.
         filter_following: Boolean, True if we only want to see recommendations from followed users.
+        topic: optional topic term (from a chip). Only posts about that topic are considered.
 
     Returns:
         A list of 5 recommended posts, in reverse-chronological order.
 
-    To test whether your recommendation algorithm works, let's pretend we like the DIY topic. Here are some users that often post DIY comment and a few example posts. Make sure your account did not engage with anything else. You should test your algorithm with these and see if your recommendation algorithm picks up on your interest in DIY and starts showing related content.
+    To test whether your recommendation algorithm works, let's pretend we like the DIY topic.
+    Here are some users that often post DIY comment and a few example posts. 
+    Make sure your account did not engage with anything else. You should test your 
+    algorithm with these and see if your recommendation algorithm picks up on your interest 
+    in DIY and starts showing related content.
     
     Users: @starboy99, @DancingDolphin, @blogger_bob
     Posts: 1810, 1875, 1880, 2113
@@ -1344,11 +1485,69 @@ def recommend(user_id, filter_following):
     - https://www.nvidia.com/en-us/glossary/recommendation-system/
     - http://www.configworks.com/mz/handout_recsys_sac2010.pdf
     - https://www.researchgate.net/publication/227268858_Recommender_Systems_Handbook
+
+    Approach: content-based filtering. Each post is a set of topic terms (hashtags and
+    words, safe and popular ones only). The user's profile is the IDF-weighted sum of the
+    terms in posts they commented on (x3), reacted to (x2) or whose authors they follow (x1).
+    A post's score is its overlap with the profile (normalised by post length, so long
+    posts are not favoured), with a mild boost for reactions and for recent posts.
+    With no usable profile (logged out / no engagement) it falls back to popular posts.
     """
 
-    recommended_posts = {} 
+    post_terms, vocab = get_topic_index()
+    profile = build_user_profile(user_id, post_terms, vocab)
+ 
+    # candidate posts the viewer may see (respects shadow bans), with popularity + age
+    vis_sql, vis_params = visible_sql("p")
+    conditions, params = [vis_sql], list(vis_params)
+    if filter_following and user_id:
+        conditions.append("p.user_id IN (SELECT followed_id FROM follows WHERE follower_id = ?)")
+        params.append(user_id)
+    if user_id:
+        conditions.append("p.user_id != ?")
+        params.append(user_id)
+ 
+    candidates = query_db(f"""
+        SELECT p.id, p.content, p.created_at, u.username, u.id AS user_id,
+               IFNULL(r.n, 0) AS total_reactions,
+               MAX(julianday('now') - julianday(p.created_at), 0) AS age_days
+        FROM posts p
+        JOIN users u ON u.id = p.user_id
+        LEFT JOIN (SELECT post_id, COUNT(*) AS n FROM reactions GROUP BY post_id) r
+               ON r.post_id = p.id
+        WHERE {' AND '.join(conditions)}
+    """, params)
+ 
+    engaged = _engaged_post_ids(user_id) if (user_id and EXCLUDE_ENGAGED) else set()
+    topic = (topic or "").strip().lower() or None
+ 
+    scored, fallback = [], []
+    for row in candidates:
+        pid = row["id"]
+        if pid in engaged or pid not in post_terms:      # engaged already, or failed moderation
+            continue
+        terms = post_terms[pid]
+        if topic and topic not in terms and ("#" + topic) not in terms:
+            continue
+        popularity = 1 + 0.1 * math.log1p(row["total_reactions"])
+        freshness = 1 + 0.2 / (1 + row["age_days"] / 30.0)
+        match = sum(profile.get(t, 0.0) for t in terms)
+        if match > 0:
+            score = match / math.sqrt(len(terms)) * popularity * freshness
+            scored.append((score, row))
+        else:
+            fallback.append((row["total_reactions"], row["created_at"], row))
+ 
+    scored.sort(key=lambda x: x[0], reverse=True)
+    picked = [row for _, row in scored[:RECOMMEND_COUNT]]
+ 
+    if len(picked) < RECOMMEND_COUNT:                    # cold start / too few matches
+        fallback.sort(key=lambda x: (x[0], x[1]), reverse=True)
+        picked += [row for _, _, row in fallback[:RECOMMEND_COUNT - len(picked)]]
+ 
+    picked.sort(key=lambda r: r["created_at"], reverse=True)   # reverse-chronological
+    return picked
 
-    return recommended_posts;
 
 if __name__ == '__main__':
     app.run(debug=True, port=8080)

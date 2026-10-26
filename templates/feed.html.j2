@@ -45,6 +45,24 @@
   </div>
    {% endif %}
 
+</div>
+
+{% if current_sort == 'recommended' and topics|default([]) %}
+<div class="col-md-8 mx-auto mb-3 text-center">
+  <span class="text-muted me-2">Topics you might like:</span>
+  {% for t in topics %}
+    <a href="{{ url_for('feed', sort='recommended', show=current_show, topic=t.lstrip('#')) }}"
+       class="badge rounded-pill text-decoration-none me-1
+              {% if current_topic and current_topic == t.lstrip('#') %}bg-primary{% else %}bg-secondary{% endif %}">
+      {{ t if t.startswith('#') else '#' ~ t }}
+    </a>
+  {% endfor %}
+  {% if current_topic %}
+    <a href="{{ url_for('feed', sort='recommended', show=current_show) }}"
+       class="small ms-2">clear</a>
+  {% endif %}
+</div>
+{% endif %}
   
 </div>
 {% if current_sort == 'leaderboard' %}
