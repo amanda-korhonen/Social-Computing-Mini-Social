@@ -3,6 +3,12 @@
 <div class="container col-md-6 mx-auto mt-5">
   <div class="card p-4">
     <h2 class="mb-4 text-center">Sign Up</h2>
+    <p class="text-center mb-4">
+      Join <strong>{{ total_users }}</strong> people already sharing here
+      {% if online_users > 0 %}
+      · <span class="text-success">●</span> <strong>{{ online_users }}</strong> online now
+      {% endif %}
+    </p>
     <form method="POST">
       <div class="mb-3">
         <label for="username" class="form-label">Username</label>

@@ -8,6 +8,7 @@ import re
 from datetime import datetime, timezone, timedelta
 import math
 from collections import Counter, defaultdict
+from urllib.parse import quote
 
 app = Flask(__name__)
 app.secret_key = '123456789' 
@@ -1013,6 +1014,7 @@ for stmt in (
     "ALTER TABLE users ADD COLUMN shadow_ban_count INTEGER DEFAULT 0;",
     "ALTER TABLE posts ADD COLUMN shadow_hidden INTEGER DEFAULT 0;",
     "ALTER TABLE comments ADD COLUMN shadow_hidden INTEGER DEFAULT 0;",
+    "ALTER TABLE users ADD COLUMN last_seen TEXT;",
 ):
     try:
         cursor.execute(stmt)
@@ -1548,6 +1550,60 @@ def recommend(user_id, filter_following, topic=None):
     picked.sort(key=lambda r: r["created_at"], reverse=True)   # reverse-chronological
     return picked
 
+# Assignment 3 -- Design claim 9:
+# Emphasizing the number of people already participating in a community motivates more 
+# people to join than does emphasizing the community need.
+
+# 5 minutes, after which a user is considered offline. 
+# This is used to determine the number of users currently online.
+ONLINE_WINDOW_MIN = 5 
+
+@app.before_request
+def update_last_seen():
+    """Update the last_seen timestamp for the current user."""
+
+    if 'user_id' in session:
+        db = get_db()
+        db.execute('UPDATE users SET last_seen = ? WHERE id = ?', (utc_str(utc_now()), session['user_id']))
+        db.commit()
+
+@app.context_processor
+def community_stats():
+    """Provide the number of users currently online to all templates."""
+
+    total = query_db('SELECT COUNT(*) AS n FROM users', one=True)['n']
+    cutoff = utc_str(utc_now() - timedelta(minutes=ONLINE_WINDOW_MIN))
+    online = query_db('SELECT COUNT(*) AS n FROM users WHERE last_seen >= ?',
+                      (cutoff,), one=True)['n']
+    return dict(total_users=total, online_users=online)
+
+# Assignment 3 -- Design claim 4:
+# Making it easy for users to share content from a community site with their friends (e.g., via easy email,
+# Twitter, Facebook, and similar links) will increase the visibility of the community among the users’
+# friends and thereby increase the likelihood of them joining.
+@app.template_global()
+def share_email_url(post):
+    """
+    Build a mailto: link that opens the user's email app with a ready-made message
+    about this post, including a link to it and a link to the sign-up page.
+    `post` is a dict/row with id, username and content (content is already moderated
+    by the routes before it reaches the template).
+    """
+
+    post_link = url_for('post_detail', post_id=post['id'], _external=True)
+    signup_link = url_for('signup', _external=True)
+
+    snippet = (post['content'] or '').strip()
+    if len(snippet) > 140:
+        snippet = snippet[:137].rstrip() + '...'
+
+    subject = f"{post['username']} shared a post with you"
+    body = (f"{post['username']} posted this on our community:\n\n"
+            f"\"{snippet}\"\n\n"
+            f"Read it and join the conversation: {post_link}\n\n"
+            f"Want to join? Sign up here: {signup_link}\n")
+
+    return f"mailto:?subject={quote(subject, safe='')}&body={quote(body, safe='')}"
 
 if __name__ == '__main__':
     app.run(debug=True, port=8080)

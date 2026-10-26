@@ -6,6 +6,18 @@
   <img src="{{ url_for('static', filename='icon.png') }}" alt="Logo" style="height: 64px;" class="mb-4">
 </div>
 
+{% if not session.get('user_id') %}
+<div class="alert alert-light text-center">
+  Join <strong>{{ total_users }}</strong> people already sharing here
+  · <span class="text-success">●</span> <strong>{{ online_users }}</strong> online now
+  <a href="{{ url_for('signup') }}" class="btn btn-primary btn-sm ms-2">Sign up</a>
+</div>
+{% else %}
+<p class="text-center text-muted">
+  👥 {{ total_users }} members · <span class="text-success">●</span> {{ online_users }} online now
+</p>
+{% endif %}
+
 {% if session.get('user_id') %}
 <div class="col-md-8 mx-auto mb-4">
   <div class="card shadow-sm">
@@ -162,6 +174,13 @@
           </ul>
         </div>
         {% endif %}
+        <!-- Share by email (Design Claim 4) -->
+        <a href="{{ share_email_url(entry.post) }}"
+           class="btn btn-sm btn-light ms-auto"
+           style="color: #000; text-shadow: none;"
+           title="Share this post by email">
+          ✉️ Share by email
+        </a>
       </div>
 
 
