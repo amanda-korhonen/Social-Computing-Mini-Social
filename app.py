@@ -1570,11 +1570,15 @@ def update_last_seen():
 @app.context_processor
 def community_stats():
     """Provide the number of users currently online to all templates."""
-
-    total = query_db('SELECT COUNT(*) AS n FROM users', one=True)['n']
-    cutoff = utc_str(utc_now() - timedelta(minutes=ONLINE_WINDOW_MIN))
-    online = query_db('SELECT COUNT(*) AS n FROM users WHERE last_seen >= ?',
-                      (cutoff,), one=True)['n']
+    db = get_db()
+    username = session.get('username')
+    if username:
+        total = query_db('SELECT COUNT(*) AS n FROM users', one=True)['n']
+        cutoff = utc_str(utc_now() - timedelta(minutes=ONLINE_WINDOW_MIN))
+        online = query_db('SELECT COUNT(*) AS n FROM users WHERE last_seen >= ?',
+                          (cutoff,), one=True)['n']
+    else:
+        return dict(total_users=0, online_users=0)
     return dict(total_users=total, online_users=online)
 
 # Assignment 3 -- Design claim 4:
